@@ -1,8 +1,6 @@
 package com.hebrewcall.translator
 
-import android.app.Activity
 import android.content.Intent
-import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -18,11 +16,6 @@ import javax.net.ssl.HttpsURLConnection
 
 class MainActivity : AppCompatActivity() {
 
-    companion object {
-        const val REQ_MEDIA_PROJECTION = 1001
-    }
-
-    private lateinit var mediaProjectionManager: MediaProjectionManager
     private var speechRecognizer: SpeechRecognizer? = null
     private var isRunning = false
     private var direction = "he->ru"
@@ -49,8 +42,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-
         btnStart   = findViewById(R.id.btnStart)
         btnStop    = findViewById(R.id.btnStop)
         btnHe      = findViewById(R.id.btnHe)
@@ -63,32 +54,16 @@ class MainActivity : AppCompatActivity() {
         btnHe.isSelected = true
         btnHe.setOnClickListener { if (!isRunning) { direction = "he->ru"; btnHe.isSelected = true;  btnRu.isSelected = false } }
         btnRu.setOnClickListener { if (!isRunning) { direction = "ru->he"; btnRu.isSelected = true;  btnHe.isSelected = false } }
-        btnStart.setOnClickListener  { requestMediaProjection() }
+        btnStart.setOnClickListener  { startListening() }
         btnStop.setOnClickListener   { stopListening() }
         btnClear.setOnClickListener  { llMessages.removeAllViews() }
-    }
-
-    private fun requestMediaProjection() {
-        val intent = mediaProjectionManager.createScreenCaptureIntent()
-        startActivityForResult(intent, REQ_MEDIA_PROJECTION)
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_MEDIA_PROJECTION) {
-            if (resultCode == Activity.RESULT_OK && data != null) {
-                startListening()
-            } else {
-                setStatus("Отказано разрешение захвата аудио")
-            }
-        }
     }
 
     private fun startListening() {
         isRunning = true
         btnStart.visibility = View.GONE
         btnStop.visibility  = View.VISIBLE
-        setStatus("Слушаю...")
+        setStatus("Слушаю...", 0xFFFFFFFF.toInt())
         startSpeechRecognition()
     }
 
@@ -99,14 +74,13 @@ class MainActivity : AppCompatActivity() {
         speechRecognizer?.destroy()
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
         speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) { setStatus("Слушаю...") }
-            override fun onBeginningOfSpeech() { setStatus("Речь обнаружена") }
+            override fun onReadyForSpeech(params: Bundle?) { setStatus("Слушаю...", 0xFFFFFFFF.toInt()) }
+            override fun onBeginningOfSpeech() { setStatus("Речь обнаружена", 0xFF4CAF50.toInt()) }
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() { setStatus("Обработка...") }
+            override fun onEndOfSpeech() { setStatus("Обработка...", 0xFFFFFFFF.toInt()) }
 
             override fun onPartialResults(partialResults: Bundle?) {
-                // Show partial text live in the current message row
                 val partial = partialResults
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull() ?: return
@@ -126,10 +100,9 @@ class MainActivity : AppCompatActivity() {
                     if (isRunning) startSpeechRecognition()
                     return
                 }
-                setStatus("Перевожу...")
+                setStatus("Перевожу...", 0xFFFFFFFF.toInt())
                 scope.launch {
                     val (from, to) = if (direction == "he->ru") "iw" to "ru" else "ru" to "iw"
-                    // Update orig text to final recognized text
                     runOnUiThread {
                         if (currentContainer == null) createLiveRow()
                         currentTvOrig?.text = text
@@ -139,29 +112,40 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread {
                         currentTvTrans?.text = translated
                         scrollToBottom()
-                        // Seal the current row — next speech gets a new row
                         currentContainer = null
                         currentTvOrig    = null
                         currentTvTrans   = null
                         currentOrigText  = ""
                     }
-                    setStatus("Слушаю...")
+                    setStatus("Слушаю...", 0xFFFFFFFF.toInt())
                     if (isRunning) startSpeechRecognition()
                 }
             }
 
             override fun onError(error: Int) {
-                // Seal any in-progress row silently
+                val errorMsg = when(error) {
+                    1 -> "ERROR_NETWORK (1)"
+                    2 -> "ERROR_SERVER (2)"
+                    3 -> "ERROR_AUDIO (3)"
+                    4 -> "ERROR_CLIENT (4)"
+                    5 -> "ERROR_SPEECH_TIMEOUT (5) - слишком тихо"
+                    6 -> "ERROR_NO_MATCH (6) - не распознал"
+                    7 -> "ERROR_NO_MATCH (7) - не распознал"
+                    8 -> "ERROR_RECOGNIZER_BUSY (8)"
+                    9 -> "ERROR_INSUFFICIENT_PERMISSIONS (9) - нет разрешения"
+                    else -> "ERROR ($error)"
+                }
+                setStatus(errorMsg, 0xFFFF5252.toInt())
                 runOnUiThread {
                     currentContainer = null
                     currentTvOrig    = null
                     currentTvTrans   = null
                     currentOrigText  = ""
                 }
-                if (isRunning) {
+                if (isRunning && error !in listOf(8, 9)) {
                     scope.launch {
-                        delay(300)
-                        startSpeechRecognition()
+                        delay(if (error in 6..7) 500 else 1000)
+                        if (isRunning) startSpeechRecognition()
                     }
                 }
             }
@@ -174,7 +158,6 @@ class MainActivity : AppCompatActivity() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            // Wait longer for silence before ending a phrase
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
@@ -182,10 +165,6 @@ class MainActivity : AppCompatActivity() {
         speechRecognizer?.startListening(intent)
     }
 
-    /**
-     * Create a new live message row at the bottom of the list.
-     * The original text and translation will be updated in-place.
-     */
     private fun createLiveRow() {
         val isHeRu = direction == "he->ru"
         val container = LinearLayout(this).apply {
@@ -232,11 +211,14 @@ class MainActivity : AppCompatActivity() {
         currentOrigText  = ""
         btnStart.visibility = View.VISIBLE
         btnStop.visibility  = View.GONE
-        setStatus("Остановлено")
+        setStatus("Остановлено", 0xFFFFFFFF.toInt())
     }
 
-    private fun setStatus(text: String) {
-        runOnUiThread { tvStatus.text = text }
+    private fun setStatus(text: String, color: Int) {
+        runOnUiThread { 
+            tvStatus.text = text
+            tvStatus.setTextColor(color)
+        }
     }
 
     private suspend fun translate(text: String, from: String, to: String): String {
