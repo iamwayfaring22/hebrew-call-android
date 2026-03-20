@@ -1,164 +1,234 @@
 package com.hebrewcall.translator
 
-import android.Manifest
-import android.content.ComponentName
-import android.content.Context
+import android.app.Activity
 import android.content.Intent
-import android.content.ServiceConnection
-import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.os.Bundle
-import android.os.IBinder
-import android.view.WindowManager
-import android.widget.Toast
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.view.View
+import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
-import com.hebrewcall.translator.databinding.ActivityMainBinding
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
+import org.json.JSONArray
+import java.net.URL
+import java.net.URLEncoder
+import javax.net.ssl.HttpsURLConnection
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var binding: ActivityMainBinding
-    private var captureService: CallCaptureService? = null
-    private var isBound = false
-    private var isRunning = false
-    private var direction = Direction.HE_TO_RU
-
-    enum class Direction { HE_TO_RU, RU_TO_HE }
-
-    private val connection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName, service: IBinder) {
-            val binder = service as CallCaptureService.LocalBinder
-            captureService = binder.getService()
-            isBound = true
-            captureService?.onTranslation = { original, translated ->
-                runOnUiThread {
-                    appendTranslation(original, translated)
-                }
-            }
-        }
-        override fun onServiceDisconnected(name: ComponentName) {
-            isBound = false
-            captureService = null
-        }
+    companion object {
+        const val REQ_MEDIA_PROJECTION = 1001
     }
+
+    private lateinit var mediaProjectionManager: MediaProjectionManager
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var isRunning = false
+    private var direction = "he->ru"
+
+    // UI
+    private lateinit var btnStart: Button
+    private lateinit var btnStop: Button
+    private lateinit var btnHe: Button
+    private lateinit var btnRu: Button
+    private lateinit var tvStatus: TextView
+    private lateinit var llMessages: LinearLayout
+    private lateinit var scrollView: ScrollView
+    private lateinit var btnClear: Button
+
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setContentView(R.layout.activity_main)
 
-        setupUI()
-        checkPermissions()
+        mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+        btnStart  = findViewById(R.id.btnStart)
+        btnStop   = findViewById(R.id.btnStop)
+        btnHe     = findViewById(R.id.btnHe)
+        btnRu     = findViewById(R.id.btnRu)
+        tvStatus  = findViewById(R.id.tvStatus)
+        llMessages = findViewById(R.id.llMessages)
+        scrollView = findViewById(R.id.scrollView)
+        btnClear  = findViewById(R.id.btnClear)
+
+        btnHe.isSelected = true
+
+        btnHe.setOnClickListener {
+            if (!isRunning) { direction = "he->ru"; btnHe.isSelected = true; btnRu.isSelected = false }
+        }
+        btnRu.setOnClickListener {
+            if (!isRunning) { direction = "ru->he"; btnRu.isSelected = true; btnHe.isSelected = false }
+        }
+
+        btnStart.setOnClickListener { requestMediaProjection() }
+        btnStop.setOnClickListener  { stopListening() }
+        btnClear.setOnClickListener { llMessages.removeAllViews() }
     }
 
-    private fun setupUI() {
-        updateDirectionUI()
+    // Step 1: ask user to allow audio capture
+    private fun requestMediaProjection() {
+        val intent = mediaProjectionManager.createScreenCaptureIntent()
+        startActivityForResult(intent, REQ_MEDIA_PROJECTION)
+    }
 
-        binding.btnHeRu.setOnClickListener {
-            if (!isRunning) {
-                direction = Direction.HE_TO_RU
-                updateDirectionUI()
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_MEDIA_PROJECTION) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                // User allowed - start listening
+                startListening()
+            } else {
+                setStatus("Отказано разрешение захвата аудио")
             }
         }
-        binding.btnRuHe.setOnClickListener {
-            if (!isRunning) {
-                direction = Direction.RU_TO_HE
-                updateDirectionUI()
-            }
-        }
-
-        binding.btnStartStop.setOnClickListener {
-            if (isRunning) stopTranslation() else startTranslation()
-        }
-
-        binding.btnClear.setOnClickListener {
-            binding.tvTranslations.text = ""
-        }
     }
 
-    private fun updateDirectionUI() {
-        val heRuActive = direction == Direction.HE_TO_RU
-        binding.btnHeRu.alpha = if (heRuActive) 1.0f else 0.4f
-        binding.btnRuHe.alpha = if (!heRuActive) 1.0f else 0.4f
-        binding.tvDirection.text = if (heRuActive) "ג'רסה - עברית ► רוסית" else "ג'רסה - רוסית ► עברית"
-    }
-
-    private fun startTranslation() {
-        if (!hasPermissions()) {
-            checkPermissions()
-            return
-        }
+    private fun startListening() {
         isRunning = true
-        binding.btnStartStop.text = "עצור / STOP"
-        binding.btnStartStop.setBackgroundColor(getColor(R.color.stop_red))
-        binding.btnHeRu.isEnabled = false
-        binding.btnRuHe.isEnabled = false
-        binding.tvStatus.text = "מאזין..."
+        btnStart.visibility = View.GONE
+        btnStop.visibility  = View.VISIBLE
+        setStatus("Слушаю...")
 
-        val lang = if (direction == Direction.HE_TO_RU) "he-IL" else "ru-RU"
-        val targetLang = if (direction == Direction.HE_TO_RU) "ru" else "he"
-
-        Intent(this, CallCaptureService::class.java).also { intent ->
-            intent.putExtra("lang", lang)
-            intent.putExtra("targetLang", targetLang)
-            ContextCompat.startForegroundService(this, intent)
-            bindService(intent, connection, Context.BIND_AUTO_CREATE)
-        }
+        startSpeechRecognition()
     }
 
-    private fun stopTranslation() {
+    private fun startSpeechRecognition() {
+        if (!isRunning) return
+
+        val lang = if (direction == "he->ru") "iw-IL" else "ru-RU"
+
+        speechRecognizer?.destroy()
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        speechRecognizer?.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) { setStatus("Слушаю...") }
+            override fun onBeginningOfSpeech() { setStatus("Речь обнаружена") }
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() { setStatus("Обработка...") }
+            override fun onError(error: Int) {
+                if (isRunning) {
+                    // auto-restart on no-speech/timeout errors
+                    scope.launch {
+                        delay(300)
+                        startSpeechRecognition()
+                    }
+                }
+            }
+            override fun onResults(results: Bundle?) {
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val text = matches?.firstOrNull() ?: return
+                if (text.isNotBlank()) {
+                    setStatus("Перевожу...")
+                    scope.launch {
+                        val (from, to) = if (direction == "he->ru") "iw" to "ru" else "ru" to "iw"
+                        val translated = translate(text, from, to)
+                        addMessage(text, translated)
+                        setStatus("Слушаю...")
+                        // continue listening
+                        if (isRunning) startSpeechRecognition()
+                    }
+                } else {
+                    if (isRunning) startSpeechRecognition()
+                }
+            }
+            override fun onPartialResults(partialResults: Bundle?) {
+                val partial = partialResults
+                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull() ?: return
+                setStatus("Слушаю: $partial")
+            }
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+        speechRecognizer?.startListening(intent)
+    }
+
+    private fun stopListening() {
         isRunning = false
-        binding.btnStartStop.text = "התחל / START"
-        binding.btnStartStop.setBackgroundColor(getColor(R.color.start_green))
-        binding.btnHeRu.isEnabled = true
-        binding.btnRuHe.isEnabled = true
-        binding.tvStatus.text = "עצור"
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+        btnStart.visibility = View.VISIBLE
+        btnStop.visibility  = View.GONE
+        setStatus("Остановлено")
+    }
 
-        if (isBound) {
-            unbindService(connection)
-            isBound = false
+    private fun setStatus(text: String) {
+        runOnUiThread { tvStatus.text = text }
+    }
+
+    private fun addMessage(original: String, translated: String) {
+        runOnUiThread {
+            val isHeRu = direction == "he->ru"
+
+            val container = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(24, 16, 24, 16)
+                setBackgroundColor(0xFF0D0D0D.toInt())
+                val lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, 0, 0, 8) }
+                layoutParams = lp
+            }
+
+            val tvOrig = TextView(this).apply {
+                text = original
+                textSize = 15f
+                setTextColor(if (isHeRu) 0xFFA3E635.toInt() else 0xFF93C5FD.toInt())
+                if (isHeRu) textAlignment = View.TEXT_ALIGNMENT_TEXT_END
+            }
+
+            val tvTrans = TextView(this).apply {
+                text = translated
+                textSize = 14f
+                setTextColor(if (isHeRu) 0xFFE0E0E0.toInt() else 0xFF93C5FD.toInt())
+                setPadding(0, 8, 0, 0)
+            }
+
+            container.addView(tvOrig)
+            container.addView(tvTrans)
+            llMessages.addView(container)
+
+            scrollView.post { scrollView.fullScroll(View.FOCUS_DOWN) }
         }
-        stopService(Intent(this, CallCaptureService::class.java))
     }
 
-    private fun appendTranslation(original: String, translated: String) {
-        val isHeRu = direction == Direction.HE_TO_RU
-        val text = binding.tvTranslations.text.toString()
-        val newEntry = if (isHeRu) {
-            "🔵 $original\n➡️ $translated\n\n"
-        } else {
-            "🟢 $original\n➡️ $translated\n\n"
-        }
-        binding.tvTranslations.text = newEntry + text
-        binding.tvStatus.text = "פעיל"
-    }
-
-    private fun hasPermissions(): Boolean {
-        return ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
-            PackageManager.PERMISSION_GRANTED
-    }
-
-    private fun checkPermissions() {
-        if (!hasPermissions()) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 100)
-        }
-    }
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 100 && grantResults.isNotEmpty() && grantResults[0] != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "אנא אפשר גישה למיקרופון", Toast.LENGTH_LONG).show()
+    private suspend fun translate(text: String, from: String, to: String): String {
+        return withContext(Dispatchers.IO) {
+            try {
+                val encoded = URLEncoder.encode(text, "UTF-8")
+                val url = URL("https://translate.googleapis.com/translate_a/single?client=gtx&sl=$from&tl=$to&dt=t&q=$encoded")
+                val conn = url.openConnection() as HttpsURLConnection
+                conn.requestMethod = "GET"
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+                val response = conn.inputStream.bufferedReader().readText()
+                conn.disconnect()
+                val arr = JSONArray(response)
+                val parts = arr.getJSONArray(0)
+                val sb = StringBuilder()
+                for (i in 0 until parts.length()) {
+                    val chunk = parts.getJSONArray(i)
+                    if (!chunk.isNull(0)) sb.append(chunk.getString(0))
+                }
+                sb.toString()
+            } catch (e: Exception) {
+                "[ошибка: ${e.message}]"
+            }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        if (isBound) {
-            unbindService(connection)
-            isBound = false
-        }
+        stopListening()
+        scope.cancel()
     }
 }
