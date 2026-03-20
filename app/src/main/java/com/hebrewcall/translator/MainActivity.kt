@@ -27,6 +27,12 @@ class MainActivity : AppCompatActivity() {
     private var isRunning = false
     private var direction = "he->ru"
 
+    // Live message views updated in real time
+    private var currentContainer: LinearLayout? = null
+    private var currentTvOrig: TextView? = null
+    private var currentTvTrans: TextView? = null
+    private var currentOrigText = ""
+
     // UI
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
@@ -45,30 +51,23 @@ class MainActivity : AppCompatActivity() {
 
         mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        btnStart  = findViewById(R.id.btnStart)
-        btnStop   = findViewById(R.id.btnStop)
-        btnHe     = findViewById(R.id.btnHe)
-        btnRu     = findViewById(R.id.btnRu)
-        tvStatus  = findViewById(R.id.tvStatus)
+        btnStart   = findViewById(R.id.btnStart)
+        btnStop    = findViewById(R.id.btnStop)
+        btnHe      = findViewById(R.id.btnHe)
+        btnRu      = findViewById(R.id.btnRu)
+        tvStatus   = findViewById(R.id.tvStatus)
         llMessages = findViewById(R.id.llMessages)
         scrollView = findViewById(R.id.scrollView)
-        btnClear  = findViewById(R.id.btnClear)
+        btnClear   = findViewById(R.id.btnClear)
 
         btnHe.isSelected = true
-
-        btnHe.setOnClickListener {
-            if (!isRunning) { direction = "he->ru"; btnHe.isSelected = true; btnRu.isSelected = false }
-        }
-        btnRu.setOnClickListener {
-            if (!isRunning) { direction = "ru->he"; btnRu.isSelected = true; btnHe.isSelected = false }
-        }
-
-        btnStart.setOnClickListener { requestMediaProjection() }
-        btnStop.setOnClickListener  { stopListening() }
-        btnClear.setOnClickListener { llMessages.removeAllViews() }
+        btnHe.setOnClickListener { if (!isRunning) { direction = "he->ru"; btnHe.isSelected = true;  btnRu.isSelected = false } }
+        btnRu.setOnClickListener { if (!isRunning) { direction = "ru->he"; btnRu.isSelected = true;  btnHe.isSelected = false } }
+        btnStart.setOnClickListener  { requestMediaProjection() }
+        btnStop.setOnClickListener   { stopListening() }
+        btnClear.setOnClickListener  { llMessages.removeAllViews() }
     }
 
-    // Step 1: ask user to allow audio capture
     private fun requestMediaProjection() {
         val intent = mediaProjectionManager.createScreenCaptureIntent()
         startActivityForResult(intent, REQ_MEDIA_PROJECTION)
@@ -78,7 +77,6 @@ class MainActivity : AppCompatActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_MEDIA_PROJECTION) {
             if (resultCode == Activity.RESULT_OK && data != null) {
-                // User allowed - start listening
                 startListening()
             } else {
                 setStatus("Отказано разрешение захвата аудио")
@@ -91,13 +89,11 @@ class MainActivity : AppCompatActivity() {
         btnStart.visibility = View.GONE
         btnStop.visibility  = View.VISIBLE
         setStatus("Слушаю...")
-
         startSpeechRecognition()
     }
 
     private fun startSpeechRecognition() {
         if (!isRunning) return
-
         val lang = if (direction == "he->ru") "iw-IL" else "ru-RU"
 
         speechRecognizer?.destroy()
@@ -108,38 +104,68 @@ class MainActivity : AppCompatActivity() {
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
             override fun onEndOfSpeech() { setStatus("Обработка...") }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                // Show partial text live in the current message row
+                val partial = partialResults
+                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull() ?: return
+                if (partial.isBlank()) return
+                runOnUiThread {
+                    if (currentContainer == null) createLiveRow()
+                    currentTvOrig?.text = partial
+                    currentOrigText = partial
+                    scrollToBottom()
+                }
+            }
+
+            override fun onResults(results: Bundle?) {
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val text = matches?.firstOrNull() ?: return
+                if (text.isBlank()) {
+                    if (isRunning) startSpeechRecognition()
+                    return
+                }
+                setStatus("Перевожу...")
+                scope.launch {
+                    val (from, to) = if (direction == "he->ru") "iw" to "ru" else "ru" to "iw"
+                    // Update orig text to final recognized text
+                    runOnUiThread {
+                        if (currentContainer == null) createLiveRow()
+                        currentTvOrig?.text = text
+                        currentOrigText = text
+                    }
+                    val translated = translate(text, from, to)
+                    runOnUiThread {
+                        currentTvTrans?.text = translated
+                        scrollToBottom()
+                        // Seal the current row — next speech gets a new row
+                        currentContainer = null
+                        currentTvOrig    = null
+                        currentTvTrans   = null
+                        currentOrigText  = ""
+                    }
+                    setStatus("Слушаю...")
+                    if (isRunning) startSpeechRecognition()
+                }
+            }
+
             override fun onError(error: Int) {
+                // Seal any in-progress row silently
+                runOnUiThread {
+                    currentContainer = null
+                    currentTvOrig    = null
+                    currentTvTrans   = null
+                    currentOrigText  = ""
+                }
                 if (isRunning) {
-                    // auto-restart on no-speech/timeout errors
                     scope.launch {
                         delay(300)
                         startSpeechRecognition()
                     }
                 }
             }
-            override fun onResults(results: Bundle?) {
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                val text = matches?.firstOrNull() ?: return
-                if (text.isNotBlank()) {
-                    setStatus("Перевожу...")
-                    scope.launch {
-                        val (from, to) = if (direction == "he->ru") "iw" to "ru" else "ru" to "iw"
-                        val translated = translate(text, from, to)
-                        addMessage(text, translated)
-                        setStatus("Слушаю...")
-                        // continue listening
-                        if (isRunning) startSpeechRecognition()
-                    }
-                } else {
-                    if (isRunning) startSpeechRecognition()
-                }
-            }
-            override fun onPartialResults(partialResults: Bundle?) {
-                val partial = partialResults
-                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull() ?: return
-                setStatus("Слушаю: $partial")
-            }
+
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
 
@@ -148,14 +174,62 @@ class MainActivity : AppCompatActivity() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            // Wait longer for silence before ending a phrase
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
         }
         speechRecognizer?.startListening(intent)
+    }
+
+    /**
+     * Create a new live message row at the bottom of the list.
+     * The original text and translation will be updated in-place.
+     */
+    private fun createLiveRow() {
+        val isHeRu = direction == "he->ru"
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 16, 24, 16)
+            setBackgroundColor(0xFF0D0D0D.toInt())
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 0, 0, 8) }
+        }
+        val tvOrig = TextView(this).apply {
+            text = ""
+            textSize = 15f
+            setTextColor(if (isHeRu) 0xFFC8F565.toInt() else 0xFF93C5FD.toInt())
+            if (isHeRu) textAlignment = View.TEXT_ALIGNMENT_TEXT_END
+        }
+        val tvTrans = TextView(this).apply {
+            text = ""
+            textSize = 14f
+            setTextColor(if (isHeRu) 0xFFE0E0E0.toInt() else 0xFF93C5FD.toInt())
+            setPadding(0, 8, 0, 0)
+        }
+        container.addView(tvOrig)
+        container.addView(tvTrans)
+        llMessages.addView(container)
+
+        currentContainer = container
+        currentTvOrig    = tvOrig
+        currentTvTrans   = tvTrans
+    }
+
+    private fun scrollToBottom() {
+        scrollView.post { scrollView.fullScroll(View.FOCUS_DOWN) }
     }
 
     private fun stopListening() {
         isRunning = false
         speechRecognizer?.destroy()
         speechRecognizer = null
+        currentContainer = null
+        currentTvOrig    = null
+        currentTvTrans   = null
+        currentOrigText  = ""
         btnStart.visibility = View.VISIBLE
         btnStop.visibility  = View.GONE
         setStatus("Остановлено")
@@ -163,43 +237,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun setStatus(text: String) {
         runOnUiThread { tvStatus.text = text }
-    }
-
-    private fun addMessage(original: String, translated: String) {
-        runOnUiThread {
-            val isHeRu = direction == "he->ru"
-
-            val container = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(24, 16, 24, 16)
-                setBackgroundColor(0xFF0D0D0D.toInt())
-                val lp = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { setMargins(0, 0, 0, 8) }
-                layoutParams = lp
-            }
-
-            val tvOrig = TextView(this).apply {
-                text = original
-                textSize = 15f
-                setTextColor(if (isHeRu) 0xFFA3E635.toInt() else 0xFF93C5FD.toInt())
-                if (isHeRu) textAlignment = View.TEXT_ALIGNMENT_TEXT_END
-            }
-
-            val tvTrans = TextView(this).apply {
-                text = translated
-                textSize = 14f
-                setTextColor(if (isHeRu) 0xFFE0E0E0.toInt() else 0xFF93C5FD.toInt())
-                setPadding(0, 8, 0, 0)
-            }
-
-            container.addView(tvOrig)
-            container.addView(tvTrans)
-            llMessages.addView(container)
-
-            scrollView.post { scrollView.fullScroll(View.FOCUS_DOWN) }
-        }
     }
 
     private suspend fun translate(text: String, from: String, to: String): String {
